@@ -5,6 +5,8 @@ package handlers
 import (
 	"encoding/json"
 	"fmt"
+	"html/template"
+	"io/ioutil"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -81,16 +83,20 @@ type ServiceInfo struct {
 // ServiceSet is the base type for the HTTP handlers which combines multiple
 // mbtiles.DB tilesets.
 type ServiceSet struct {
-	tilesets map[string]*mbtiles.DB
-	Domain   string
-	Path     string
+	tilesets  map[string]*mbtiles.DB
+	templates *template.Template
+	Domain    string
+	Path      string
 }
 
 // New returns a new ServiceSet. Use AddDBOnPath to add a mbtiles file.
 func New() *ServiceSet {
-	return &ServiceSet{
-		tilesets: make(map[string]*mbtiles.DB),
+	s := &ServiceSet{
+		tilesets:  make(map[string]*mbtiles.DB),
+		templates: template.New("base"),
 	}
+	return s
+
 }
 
 // AddDBOnPath interprets filename as mbtiles file which is opened and which will be
@@ -234,10 +240,59 @@ func (s *ServiceSet) serviceInfo(id string, db *mbtiles.DB) handlerFunc {
 	}
 }
 
-func (s *ServiceSet) serviceHTML(db *mbtiles.DB) handlerFunc {
+func tmplFromAssets(t *template.Template, name string) (*template.Template, error) {
+	f, err := Assets.Open("/" + name + ".html")
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	buf, err := ioutil.ReadAll(f)
+	if err != nil {
+		return nil, err
+	}
+	n, err := t.New(name).Parse(string(buf))
+	if err != nil {
+		return nil, err
+	}
+	return n, nil
+}
+
+func (s *ServiceSet) executeTemplate(w http.ResponseWriter, name string, data interface{}) (int, error) {
+	t := s.templates.Lookup(name)
+	var err error
+	if t == nil {
+		t, err = tmplFromAssets(s.templates, name)
+		if err != nil {
+			err = fmt.Errorf("could not parse template asset %q: %v", name, err)
+			return http.StatusInternalServerError, err
+		}
+	}
+	err = t.Execute(w, data)
+	return 0, err
+}
+
+type templateParams struct {
+	URL string
+	ID  string
+}
+
+func (s *ServiceSet) serviceHTML(id string, db *mbtiles.DB) handlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) (int, error) {
-		// TODO implement this
-		return http.StatusNotImplemented, nil
+		p := struct {
+			URL string
+			ID  string
+		}{
+			fmt.Sprintf("%s%s", s.RootURL(r), strings.TrimSuffix(r.URL.Path, "/map")),
+			id,
+		}
+
+		switch db.TileFormat() {
+		default:
+			return s.executeTemplate(w, "map", p)
+		case mbtiles.PBF:
+			return s.executeTemplate(w, "map_gl", p)
+
+		}
 	}
 }
 
@@ -375,7 +430,7 @@ func (s *ServiceSet) Handler(ef func(error)) http.Handler {
 	for id, db := range s.tilesets {
 		p := "/services/" + id
 		m.Handle(p, wrapGetWithErrors(ef, s.serviceInfo(id, db)))
-		m.Handle(p+"/map", wrapGetWithErrors(ef, s.serviceHTML(db)))
+		m.Handle(p+"/map", wrapGetWithErrors(ef, s.serviceHTML(id, db)))
 		m.Handle(p+"/tiles/", wrapGetWithErrors(ef, s.tiles(db)))
 		// TODO arcgis handlers
 		// p = "//arcgis/rest/services/" + id + "/MapServer"
